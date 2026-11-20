@@ -109,8 +109,10 @@ func (l *browserFrameLoop) onVisibilityChange(_ js.Value, _ []js.Value) any {
 		l.cancelPendingFrame()
 		return nil
 	}
-	// Do not advance simulation by the time spent in a suspended tab.
-	l.app.lastFrame = time.Now()
+	// Do not advance simulation by the time spent in a suspended tab:
+	// re-anchor the clock so the hidden duration cannot be replayed as a
+	// fixed-step catch-up burst (or a clamped-but-large variable delta).
+	l.app.clockRebase(time.Now())
 	l.app.RequestRedraw()
 	return nil
 }

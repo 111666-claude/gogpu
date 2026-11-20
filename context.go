@@ -23,6 +23,10 @@ type Context struct {
 	surface     *RenderTarget // target window surface (nil = use renderer.primary)
 	scaleFactor float64       // DPI scale factor (1.0 = standard, 2.0 = Retina/HiDPI)
 	cleared     bool
+
+	// interpolationAlpha is the fixed-step render blend ratio in [0,1].
+	// 1.0 (the default and the variable-step value) means the latest state.
+	interpolationAlpha float64
 }
 
 // newContext creates a new drawing context for the primary window.
@@ -31,8 +35,9 @@ func newContext(renderer *Renderer, scaleFactor float64) *Context {
 		scaleFactor = 1.0
 	}
 	return &Context{
-		renderer:    renderer,
-		scaleFactor: scaleFactor,
+		renderer:           renderer,
+		scaleFactor:        scaleFactor,
+		interpolationAlpha: 1.0,
 	}
 }
 
@@ -43,10 +48,32 @@ func newContextForSurface(renderer *Renderer, ws *RenderTarget, scaleFactor floa
 		scaleFactor = 1.0
 	}
 	return &Context{
-		renderer:    renderer,
-		surface:     ws,
-		scaleFactor: scaleFactor,
+		renderer:           renderer,
+		surface:            ws,
+		scaleFactor:        scaleFactor,
+		interpolationAlpha: 1.0,
 	}
+}
+
+// setInterpolationAlpha records the frame's render blend ratio. Called by the
+// frame loop after construction; clamps defensively to [0,1].
+func (c *Context) setInterpolationAlpha(alpha float64) {
+	if alpha < 0 {
+		alpha = 0
+	} else if alpha > 1 {
+		alpha = 1
+	}
+	c.interpolationAlpha = alpha
+}
+
+// InterpolationAlpha returns the fixed-timestep interpolation ratio for this
+// frame, in [0,1]. A value of 0 selects the previous simulation state and 1
+// the latest state; values in between blend the two so rendering stays smooth
+// even when the displayed frame does not line up with a simulation tick.
+// Without a configured fixed step (and whenever no fixed step is active) this
+// returns 1.0. Equivalent to App.InterpolationAlpha() at frame time.
+func (c *Context) InterpolationAlpha() float64 {
+	return c.interpolationAlpha
 }
 
 // activeSurface returns the RenderTarget targeted by this Context.

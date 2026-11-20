@@ -4,6 +4,7 @@ import (
 	"image"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/gogpu/gogpu/gpu/types"
 	"github.com/gogpu/gputypes"
@@ -67,6 +68,25 @@ type Config struct {
 	// When true, renders every frame at VSync rate — suitable for games/animations.
 	// Use WithContinuousRender(true) for game loops.
 	ContinuousRender bool
+
+	// FixedStep enables the deterministic fixed-timestep loop when positive.
+	// OnUpdate is then invoked with exactly FixedStep seconds of simulation
+	// time, zero or more times per rendered frame, instead of the variable
+	// wall-clock delta. Rendering reads App.InterpolationAlpha() (also exposed
+	// via Context.InterpolationAlpha()) to blend between the previous and
+	// latest simulation state, so a one-frame hitch never makes physics jump
+	// or the picture stutter.
+	//
+	// Zero or negative (the default) keeps the legacy variable-step behavior.
+	// A typical value is time.Second/60 (16.667ms).
+	FixedStep time.Duration
+
+	// MaxSubSteps caps how many FixedStep updates a single rendered frame may
+	// run while catching up after a stall (pause, focus loss, slow frame).
+	// Backlog beyond the cap is discarded, not carried, so the loop can never
+	// enter an unbounded catch-up spiral. Ignored unless FixedStep is positive.
+	// Zero means DefaultMaxSubSteps (5).
+	MaxSubSteps int
 
 	// Frameless removes the OS window chrome (title bar, borders).
 	// When true, the application must provide its own title bar via
@@ -252,6 +272,23 @@ func (c Config) WithVSync(vsync bool) Config {
 // When false (default): renders only on RequestRedraw() or events — power efficient.
 func (c Config) WithContinuousRender(continuous bool) Config {
 	c.ContinuousRender = continuous
+	return c
+}
+
+// WithFixedTimestep enables deterministic fixed-step simulation. OnUpdate then
+// runs at fixed simulation moments (step seconds per call), up to maxSubSteps
+// catch-up calls per rendered frame; rendering interpolates with
+// App.InterpolationAlpha(). Pass a non-positive step to return to the default
+// variable-step mode. A non-positive maxSubSteps selects DefaultMaxSubSteps.
+//
+// Combine with WithContinuousRender(true) for a classic game loop:
+//
+//	cfg := gogpu.DefaultConfig().
+//	    WithContinuousRender(true).
+//	    WithFixedTimestep(time.Second/60, 5)
+func (c Config) WithFixedTimestep(step time.Duration, maxSubSteps int) Config {
+	c.FixedStep = step
+	c.MaxSubSteps = maxSubSteps
 	return c
 }
 

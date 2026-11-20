@@ -72,6 +72,12 @@ type App struct {
 	quitOnLastWindowClosed bool         // default true — exit when last window closes
 	lastFrame              time.Time
 
+	// frameClock owns simulation time: variable-step delta or deterministic
+	// fixed-step scheduling with per-frame interpolation alpha. Lazily
+	// initialized by ensureClock so direct runFrame() tests work without
+	// startRunLoop().
+	frameClock *frameClock
+
 	// Event-driven rendering
 	invalidator   *Invalidator
 	pendingRedraw atomic.Bool
@@ -207,9 +213,54 @@ func (a *App) OnDraw(fn func(*Context)) *App {
 
 // OnUpdate sets the callback for logic updates each frame.
 // The parameter is delta time in seconds since the last frame.
+//
+// With a fixed timestep configured (Config.WithFixedTimestep), the parameter
+// is always the exact configured step and the callback runs at deterministic
+// simulation moments — zero or more times per rendered frame. Without one, it
+// is the clamped wall-clock delta and runs exactly once per frame.
 func (a *App) OnUpdate(fn func(float64)) *App {
 	a.onUpdate = fn
 	return a
+}
+
+// PauseSimulation freezes the fixed-step simulation. Frames keep rendering
+// (with the current interpolation alpha) but OnUpdate stops being called until
+// ResumeSimulation. Safe to call from any goroutine. In variable-step mode
+// this simply suppresses the OnUpdate callback while paused.
+func (a *App) PauseSimulation() {
+	a.ensureClock().Pause()
+}
+
+// ResumeSimulation restarts a PauseSimulation-frozen simulation and re-anchors
+// the clock to the current time, so the paused duration is never replayed as a
+// burst of catch-up steps. Safe to call from any goroutine.
+func (a *App) ResumeSimulation() {
+	a.ensureClock().Resume(time.Now())
+}
+
+// IsSimulationPaused reports whether PauseSimulation is active.
+func (a *App) IsSimulationPaused() bool {
+	return a.ensureClock().isPaused()
+}
+
+// InterpolationAlpha returns the render interpolation ratio in [0,1] for the
+// current frame: 0 means render the previous simulation state, 1 means the
+// latest state. In fixed-step mode it is the fractional position between the
+// two most recent OnUpdate ticks; in variable-step mode it is always 1.0.
+//
+// Typical use inside OnDraw:
+//
+//	alpha := app.InterpolationAlpha()
+//	x := prevX + (curX-prevX)*alpha
+func (a *App) InterpolationAlpha() float64 {
+	return a.ensureClock().interpolationAlpha()
+}
+
+// TimestepStats returns cumulative fixed-step scheduler counters (executed
+// steps, discarded catch-up steps, clock re-anchors). Safe to call from any
+// goroutine.
+func (a *App) TimestepStats() TimestepStats {
+	return a.ensureClock().snapshot()
 }
 
 // OnResize sets the callback for window resize events.
@@ -482,7 +533,8 @@ func (a *App) startRunLoop() {
 	if a.onSurfaceAvailable != nil {
 		a.onSurfaceAvailable()
 	}
-	a.lastFrame = time.Now()
+	a.ensureClock()
+	a.clockRebase(time.Now())
 	a.invalidator = newInvalidator(a.manager.WakeUp)
 	a.wakeupFn.Store(a.manager.WakeUp)
 	a.animations = &AnimationController{}
@@ -493,11 +545,21 @@ func (a *App) startRunLoop() {
 }
 
 // runFrame executes one iteration of the main loop in Run(): waits for
-// events when idle, processes platform events, ticks onUpdate, and draws
-// a frame when the three-mode state detection (ADR-023) calls for one.
+// events when idle, processes platform events, ticks the simulation clock
+// (variable delta or deterministic fixed steps), and draws a frame when the
+// three-mode state detection (ADR-023) calls for one.
 func (a *App) runFrame() {
+	// Quit requested before this iteration: deliver no further user
+	// callbacks. The outer loop exits immediately afterwards.
+	if !a.running.Load() {
+		return
+	}
+
 	continuousRender := a.config.ContinuousRender
-	animating := a.animations.IsAnimating()
+	var animating bool
+	if a.animations != nil {
+		animating = a.animations.IsAnimating()
+	}
 	invalidated := a.invalidator.Consume()
 
 	if !continuousRender && !animating && !invalidated {
@@ -515,33 +577,27 @@ func (a *App) runFrame() {
 		invalidated = true
 	}
 
-	// Calculate delta time
+	// The loop is active in CONTINUOUS mode or while an animation runs. In a
+	// purely demand-driven frame (IDLE wake-up, no animation), the legacy
+	// behavior ticks no simulation; keep that for fixed step too, so an
+	// event-driven UI does not accumulate simulated time while sitting idle.
+	loopActive := continuousRender || animating
+
+	// Advance simulation time. Fixed-step mode runs OnUpdate at deterministic
+	// simulation moments (zero or more fixed callbacks per frame); the legacy
+	// mode invokes it once with the clamped wall-clock delta.
 	now := time.Now()
-	deltaTime := now.Sub(a.lastFrame).Seconds()
 	a.lastFrame = now
-
-	// Clamp deltaTime after long idle (WaitEvents can block for seconds/minutes).
-	// Without clamping, physics and animations would jump on the first frame.
-	// 66ms = ~15 FPS minimum, a safe upper bound for a single frame step.
-	if deltaTime > 0.066 {
-		deltaTime = 0.066
+	clock := a.ensureClock()
+	dt := clock.measure(now)
+	if !loopActive && clock.fixed() {
+		// Fixed-step, demand-driven frame (idle wake-up): anchor to wall time
+		// but consume no simulated time, so the first event after an idle gap
+		// cannot trigger a burst of catch-up steps. Variable mode keeps its
+		// historical clamped-delta callback on every wake-up.
+		dt = 0
 	}
-
-	// onUpdate: ALWAYS when loop is active (ANIMATING + CONTINUOUS).
-	// UI frameworks tick animations, process signals, run layout here.
-	// If something changed, they call RequestRedraw() → invalidated = true.
-	if a.onUpdate != nil {
-		a.onUpdate(deltaTime)
-	}
-
-	// Advance input state AFTER onUpdate so edge detectors (JustPressed,
-	// JustReleased, Mouse.Delta) are visible during the callback.
-	// Update() sets previous = current, clearing edges for the next frame.
-	// Order: events → onUpdate (user reads edges) → Update (clear).
-	// Matches Ebiten, Unity, Godot — all clear edges after user callback.
-	if a.inputState != nil {
-		a.inputState.Update()
-	}
+	a.dispatchSimulation(clock.advance(dt))
 
 	// Check if onUpdate triggered RequestRedraw (UI spinner, animation tick).
 	if a.invalidator.Consume() {
@@ -554,6 +610,62 @@ func (a *App) runFrame() {
 	if (continuousRender || invalidated) && a.frameCallbackReady() {
 		a.renderFrameMultiThread()
 	}
+}
+
+// dispatchSimulation runs the OnUpdate/input bookkeeping for one frame clock
+// result. Input events were queued by processEventsMultiThread before this
+// call, so every OnUpdate in the frame — and all fixed steps in it — consume
+// the same deterministic input frame; edges are retired once afterwards.
+func (a *App) dispatchSimulation(result frameResult) {
+	// Paused: no simulation callbacks in either mode. Rendering continues with
+	// the last interpolation alpha so a paused scene stays drawn.
+	if result.paused {
+		if a.inputState != nil {
+			a.inputState.Update()
+		}
+		return
+	}
+
+	if result.fixed {
+		// Fixed step: each callback receives the exact configured step. A
+		// frame can run zero steps (fast display refresh, no accumulated time),
+		// one step, or up to MaxSubSteps catch-up steps.
+		if a.onUpdate != nil {
+			step := a.frameClock.step
+			for range result.steps {
+				a.onUpdate(step)
+			}
+		}
+	} else if a.onUpdate != nil {
+		// Legacy variable step: one clamped-delta callback per frame.
+		a.onUpdate(result.variableDelta)
+	}
+
+	// Advance input state AFTER OnUpdate so edge detectors (JustPressed,
+	// JustReleased, Mouse.Delta) are visible during the callback.
+	// Update() sets previous = current, clearing edges for the next frame.
+	// Order: events → onUpdate (user reads edges) → Update (clear).
+	// Matches Ebiten, Unity, Godot — all clear edges after user callback.
+	if a.inputState != nil {
+		a.inputState.Update()
+	}
+}
+
+// ensureClock lazily creates the frame clock from Config. Direct runFrame()
+// callers in tests bypass startRunLoop(), so the clock cannot be initialized
+// only there.
+func (a *App) ensureClock() *frameClock {
+	if a.frameClock == nil {
+		a.frameClock = newFrameClock(a.config.FixedStep.Seconds(), a.config.MaxSubSteps)
+	}
+	return a.frameClock
+}
+
+// clockRebase re-anchors the simulation clock and keeps lastFrame in sync for
+// code paths that still read it (modal frame ticks, browser visibility).
+func (a *App) clockRebase(now time.Time) {
+	a.lastFrame = now
+	a.ensureClock().rebase(now)
 }
 
 // newPlatformManagerFn creates a platform manager; replaced in tests to inject mocks.
@@ -863,6 +975,10 @@ func (a *App) classifyEvent(event *platform.Event, lastResize *platform.Event, s
 				a.windowManager.setFocus(w.id)
 			}
 		}
+		// Re-anchor the simulation clock on every focus transition so time
+		// spent unfocused can never be replayed as a fixed-step catch-up
+		// burst (and variable-step delta stays small on the first frame back).
+		a.clockRebase(time.Now())
 		if a.eventSource != nil {
 			a.eventSource.dispatchFocus(event.Focused)
 		}
@@ -1198,6 +1314,7 @@ func (a *App) renderFrameGPU(frames []windowFrame) {
 
 		// Call per-window draw callback.
 		ctx := newContextForSurface(a.renderer, ws, frame.scale)
+		ctx.setInterpolationAlpha(a.InterpolationAlpha())
 		frame.onDraw(ctx)
 
 		// No frame started. Two very different reasons:
@@ -1236,7 +1353,9 @@ func (a *App) renderFrameGPU(frames []windowFrame) {
 		// outdated, request another frame since nothing else reschedules on-demand.
 		if ws.frameStarted && a.renderer.endFrameForSurface(ws) {
 			ws.prepareLazyAcquire()
-			frame.onDraw(newContextForSurface(a.renderer, ws, ws.platWindow.ScaleFactor()))
+			retryCtx := newContextForSurface(a.renderer, ws, ws.platWindow.ScaleFactor())
+			retryCtx.setInterpolationAlpha(a.InterpolationAlpha())
+			frame.onDraw(retryCtx)
 			if ws.frameStarted && a.renderer.endFrameForSurface(ws) {
 				a.RequestRedraw()
 			}
@@ -1288,25 +1407,12 @@ func (a *App) syncFrameSurfaceSize(ws *RenderTarget, physW, physH int) {
 // is NOT called during modal drag. This prevents content re-centering artifacts.
 // The onResize callback fires after WM_EXITSIZEMOVE via normal event processing.
 func (a *App) modalFrameTick() {
-	// Delta time
+	// Drive the same simulation clock as the main loop so fixed-step physics
+	// stay deterministic inside the modal message pump.
 	now := time.Now()
-	deltaTime := now.Sub(a.lastFrame).Seconds()
 	a.lastFrame = now
-
-	// Clamp deltaTime after long idle (same as main loop).
-	if deltaTime > 0.066 {
-		deltaTime = 0.066
-	}
-
-	// Update input state
-	if a.inputState != nil {
-		a.inputState.Update()
-	}
-
-	// User logic callback
-	if a.onUpdate != nil {
-		a.onUpdate(deltaTime)
-	}
+	clock := a.ensureClock()
+	a.dispatchSimulation(clock.advance(clock.measure(now)))
 
 	// Propagate PHYSICAL window size to render thread for swapchain resize.
 	// During modal loop, processEventsMultiThread doesn't run, so

@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Deterministic fixed-timestep game loop**. `Config.WithFixedTimestep(step, maxSubSteps)` switches `OnUpdate` from
+  the variable wall-clock delta to fixed simulation moments: every callback receives exactly `step` seconds and runs
+  zero or more times per rendered frame, capped at `maxSubSteps` catch-up calls so a half-second hitch (or pause,
+  focus loss, hidden tab) can never schedule an unbounded burst — backlog beyond the cap is discarded rather than
+  carried, preventing a spiral that keeps the picture jittering after the stall is over. `App.InterpolationAlpha()`
+  and `Context.InterpolationAlpha()` expose the `[0,1]` render blend ratio between the previous and latest simulation
+  state. `App.PauseSimulation()`/`ResumeSimulation()` freeze and re-anchor the clock, focus transitions and browser
+  visibility changes re-anchor it automatically, and `App.TimestepStats()` reports executed/dropped steps and
+  re-anchors. Non-finite and backwards time readings are treated as re-anchors; zero/negative `step` retains the
+  legacy variable-step behavior, which is unchanged. See `examples/fixed_timestep`.
+
 - **Windows: input method (IME) support (IMM32)**, based on #462 by @besmpl. `App` implements `gpucontext.IMEController`:
   composition start, update and end reach `EventSource.OnIMEComposition*` with the preedit and UTF-8 byte-offset cursor
   and selection ranges, cancel and disable arrive through the optional `gpucontext.IMEEventSource`, and

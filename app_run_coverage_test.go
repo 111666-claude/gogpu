@@ -110,6 +110,7 @@ func TestApp_RunFrame_IdleThenResizeInvalidates(t *testing.T) {
 		animations:    &AnimationController{},
 		lastFrame:     time.Now(),
 	}
+	app.running.Store(true)
 	app.invalidator = newInvalidator(func() {})
 
 	app.runFrame()
@@ -124,6 +125,7 @@ func TestApp_RunFrame_ContinuousWithUpdateAndInput(t *testing.T) {
 		inputState:    input.New(),
 		config:        Config{ContinuousRender: true},
 	}
+	app.running.Store(true)
 	app.invalidator = newInvalidator(func() {})
 
 	var updateCalled bool

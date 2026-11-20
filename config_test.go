@@ -3,6 +3,7 @@ package gogpu
 import (
 	"image"
 	"testing"
+	"time"
 
 	"github.com/gogpu/gogpu/gpu/types"
 )
@@ -150,6 +151,28 @@ func TestConfigWithFramelessBuilder(t *testing.T) {
 				t.Errorf("Frameless = %v, want %v", cfg.Frameless, tt.frameless)
 			}
 		})
+	}
+}
+
+func TestConfigWithFixedTimestep(t *testing.T) {
+	// Default config keeps the legacy variable-step loop.
+	cfg := DefaultConfig()
+	if cfg.FixedStep != 0 {
+		t.Errorf("default FixedStep = %v, want 0 (variable step)", cfg.FixedStep)
+	}
+
+	cfg = cfg.WithFixedTimestep(time.Second/60, 5)
+	if cfg.FixedStep != time.Second/60 {
+		t.Errorf("FixedStep = %v, want %v", cfg.FixedStep, time.Second/60)
+	}
+	if cfg.MaxSubSteps != 5 {
+		t.Errorf("MaxSubSteps = %d, want 5", cfg.MaxSubSteps)
+	}
+
+	// Non-positive step returns the config to variable-step mode.
+	cfg = cfg.WithFixedTimestep(0, 0)
+	if cfg.FixedStep != 0 {
+		t.Errorf("zero FixedStep = %v, want 0", cfg.FixedStep)
 	}
 }
 
